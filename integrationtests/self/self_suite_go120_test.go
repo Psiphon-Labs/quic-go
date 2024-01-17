@@ -1,10 +1,11 @@
-//go:build go1.21
+//go:build go1.20 && !go1.21
 
 package self_test
 
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"flag"
 	"fmt"
@@ -16,8 +17,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	tls "github.com/Psiphon-Labs/psiphon-tls"
 
 	"github.com/Psiphon-Labs/quic-go"
 	"github.com/Psiphon-Labs/quic-go/integrationtests/tools"

@@ -3,9 +3,10 @@
 package qtls
 
 import (
-	"crypto/tls"
 	"fmt"
 	"net"
+
+	tls "github.com/Psiphon-Labs/psiphon-tls"
 
 	"github.com/Psiphon-Labs/quic-go/internal/testdata"
 
