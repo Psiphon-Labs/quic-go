@@ -22,7 +22,7 @@ var _ = Describe("Setting the Cipher Suite", func() {
 			reset := SetCipherSuite(cs)
 			defer reset()
 
-			ln, err := tls.Listen("tcp4", "localhost:0", testdata.GetTLSConfig())
+			ln, err := tls.Listen("tcp4", "localhost:0", testdata.GetTLSConfig(), nil)
 			Expect(err).ToNot(HaveOccurred())
 			defer ln.Close()
 
