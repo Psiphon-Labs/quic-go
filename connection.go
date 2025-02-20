@@ -24,30 +24,6 @@ import (
 	"github.com/Psiphon-Labs/quic-go/logging"
 )
 
-// [Psiphon]
-func getMaxPacketSize(s *connection) protocol.ByteCount {
-	initialMaxPacketSizeAdjustment := 0
-	if s.config.ServerMaxPacketSizeAdjustment != nil {
-		initialMaxPacketSizeAdjustment = s.config.ServerMaxPacketSizeAdjustment(s.RemoteAddr())
-	}
-
-	// Adjust the max packet size to allow for obfuscation overhead. This
-	// is a best-effort operation. In practice, maxPacketSizeAdustment
-	// will be tens of bytes and maxSize is over 1200 bytes; the
-	// condition here is a sanity check guard to prevent negative sizes
-	// and possible panics. We don't expect to need to make the largest
-	// adustment that would be possible when the condition is false.
-	//
-	// TODO: internal/congestion.cubicSender continues to use
-	// initialMaxDatagramSize = protocol.InitialPacketSizeIPv4
-	initialMaxPacketSize := protocol.ByteCount(s.config.InitialPacketSize)
-	if initialMaxPacketSize > protocol.ByteCount(initialMaxPacketSizeAdjustment) {
-		initialMaxPacketSize -= protocol.ByteCount(initialMaxPacketSizeAdjustment)
-	}
-
-	return initialMaxPacketSize
-}
-
 type unpacker interface {
 	UnpackLongHeader(hdr *wire.Header, data []byte) (*unpackedPacket, error)
 	UnpackShortHeader(rcvTime time.Time, data []byte) (protocol.PacketNumber, protocol.PacketNumberLen, protocol.KeyPhaseBit, []byte, error)
@@ -299,15 +275,12 @@ var newConnection = func(
 	)
 	s.preSetup()
 
-	// [Psiphon]
-	initialMaxPacketSize := getMaxPacketSize(s)
-
 	s.sentPacketHandler, s.receivedPacketHandler = ackhandler.NewAckHandler(
 		0,
 
 		// [Psiphon]
 		// protocol.ByteCount(s.config.InitialPacketSize),
-		initialMaxPacketSize,
+		s.maxPacketSize(),
 
 		s.rttStats,
 		clientAddressValidated,
@@ -319,7 +292,7 @@ var newConnection = func(
 
 	// [Psiphon]
 	// s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
-	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(initialMaxPacketSize)))
+	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(s.maxPacketSize())))
 
 	statelessResetToken := statelessResetter.GetStatelessResetToken(srcConnID)
 	params := &wire.TransportParameters{
@@ -427,7 +400,7 @@ var newClientConnection = func(
 
 		// [Psiphon]
 		// protocol.ByteCount(s.config.InitialPacketSize),
-		getMaxPacketSize(s),
+		s.maxPacketSize(),
 
 		s.rttStats,
 		false, // has no effect
@@ -436,7 +409,11 @@ var newClientConnection = func(
 		s.tracer,
 		s.logger,
 	)
-	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
+
+	// [Psiphon]
+	// s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
+	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(s.maxPacketSize())))
+
 	oneRTTStream := newCryptoStream()
 	params := &wire.TransportParameters{
 		InitialMaxStreamDataBidiRemote: protocol.ByteCount(s.config.InitialStreamReceiveWindow),
@@ -1880,6 +1857,11 @@ func (s *connection) applyTransportParameters() {
 		s.connIDManager.AddFromPreferredAddress(params.PreferredAddress.ConnectionID, params.PreferredAddress.StatelessResetToken)
 	}
 
+	maxPacketSize := protocol.ByteCount(protocol.MaxPacketBufferSize)
+	if params.MaxUDPPayloadSize > 0 && params.MaxUDPPayloadSize < maxPacketSize {
+		maxPacketSize = params.MaxUDPPayloadSize
+	}
+
 	// [Psiphon]
 	// Adjust the max packet size to allow for obfuscation overhead.
 	maxPacketSizeAdjustment := 0
@@ -1888,23 +1870,19 @@ func (s *connection) applyTransportParameters() {
 	} else {
 		maxPacketSizeAdjustment = s.config.ClientMaxPacketSizeAdjustment
 	}
-
-	maxPacketSize := protocol.ByteCount(protocol.MaxPacketBufferSize)
-	if params.MaxUDPPayloadSize > 0 && params.MaxUDPPayloadSize < maxPacketSize {
-		maxPacketSize = params.MaxUDPPayloadSize
-	}
-
-	// [Psiphon]
 	if maxPacketSize > protocol.ByteCount(maxPacketSizeAdjustment) {
 		maxPacketSize -= protocol.ByteCount(maxPacketSizeAdjustment)
 	}
+
+	// [Psiphon]
+	initialMaxPacketSize := s.maxPacketSize()
 
 	s.mtuDiscoverer = newMTUDiscoverer(
 		s.rttStats,
 
 		// [Psiphon]
 		// protocol.ByteCount(s.config.InitialPacketSize),
-		getMaxPacketSize(s),
+		initialMaxPacketSize,
 
 		maxPacketSize,
 		s.onMTUIncreased,
@@ -2259,21 +2237,54 @@ func (s *connection) sendConnectionClose(e error) ([]byte, error) {
 	return packet.buffer.Data, s.conn.Write(packet.buffer.Data, 0, ecn)
 }
 
+// [Psiphon]
+//
+//	 Upstream implementation kept for reference.
+//
+//		func (s *connection) maxPacketSize() protocol.ByteCount {
+//			if s.mtuDiscoverer == nil {
+//				// Use the configured packet size on the client side.
+//				// If the server sends a max_udp_payload_size that's smaller than this size, we can ignore this:
+//				// Apparently the server still processed the (fully padded) Initial packet anyway.
+//				if s.perspective == protocol.PerspectiveClient {
+//					return protocol.ByteCount(s.config.InitialPacketSize)
+//				}
+//				// On the server side, there's no downside to using 1200 bytes until we received the client's transport
+//				// parameters:
+//				// * If the first packet didn't contain the entire ClientHello, all we can do is ACK that packet. We don't
+//				//   need a lot of bytes for that.
+//				// * If it did, we will have processed the transport parameters and initialized the MTU discoverer.
+//				return protocol.MinInitialPacketSize
+//			}
+//			return s.mtuDiscoverer.CurrentSize()
+//		}
 func (s *connection) maxPacketSize() protocol.ByteCount {
 	if s.mtuDiscoverer == nil {
-		// Use the configured packet size on the client side.
-		// If the server sends a max_udp_payload_size that's smaller than this size, we can ignore this:
-		// Apparently the server still processed the (fully padded) Initial packet anyway.
+
+		maxPacketSize := int(s.config.InitialPacketSize)
+		maxPacketSizeAdjustment := 0
+
 		if s.perspective == protocol.PerspectiveClient {
-			return protocol.ByteCount(s.config.InitialPacketSize)
+			maxPacketSizeAdjustment = s.config.ClientMaxPacketSizeAdjustment
+		} else {
+			if s.config.ServerMaxPacketSizeAdjustment != nil {
+				maxPacketSizeAdjustment = s.config.ServerMaxPacketSizeAdjustment(s.conn.RemoteAddr())
+			}
 		}
-		// On the server side, there's no downside to using 1200 bytes until we received the client's transport
-		// parameters:
-		// * If the first packet didn't contain the entire ClientHello, all we can do is ACK that packet. We don't
-		//   need a lot of bytes for that.
-		// * If it did, we will have processed the transport parameters and initialized the MTU discoverer.
-		return protocol.MinInitialPacketSize
+
+		// Adjust the max packet size to allow for obfuscation overhead. This
+		// is a best-effort operation. In practice, maxPacketSizeAdustment
+		// will be tens of bytes and maxSize is over 1200 bytes; the
+		// condition here is a sanity check guard to prevent negative sizes
+		// and possible panics. We don't expect to need to make the largest
+		// adustment that would be possible when the condition is false.
+		if maxPacketSize > maxPacketSizeAdjustment {
+			maxPacketSize -= maxPacketSizeAdjustment
+		}
+
+		return protocol.ByteCount(maxPacketSize)
 	}
+
 	return s.mtuDiscoverer.CurrentSize()
 }
 
