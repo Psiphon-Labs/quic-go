@@ -128,7 +128,7 @@ func newSentPacketHandler(
 		congestion.DefaultClock{},
 		rttStats,
 		initialMaxDatagramSize,
-		true, // use Reno
+		false, // use Cubic
 		tracer,
 	)
 
